@@ -1,0 +1,266 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{indentfirst}
+\usepackage[hidelinks]{hyperref}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Beat-MIL: Hierarchical Multi-Instance Learning with Evidential Selective Prediction for Cross-Database ECG Arrhythmia Detection}
+
+\author{
+\IEEEauthorblockN{Abheeshta V Aradhya, Aishwarya JR, Anantha Rama S, Rashmi N Ugarakhod}
+\IEEEauthorblockA{\textit{Department of Electronics and Communication Engineering} \\
+\textit{PES University}\\
+Bangalore, India\\
+\{vabheeshta, jraishwarya21, arsanantha1890\}@gmail.com, rashmin@pes.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Public ECG databases label data at fundamentally different granularities. MIT-BIH annotates every individual beat, CPSC~2018 labels rhythm episodes, and PTB-XL provides a diagnosis for an entire recording. Existing multi-database studies either silently coerce these labels onto a common granularity --- introducing supervision noise --- or train on a single database, limiting generalization. Compounding this, deployed models output point predictions without expressing when a clinician should be brought into the loop. We propose \textbf{Beat-MIL}, a hierarchical multi-instance learning framework that learns jointly from all three label granularities through gated attention pooling and a consistency constraint, paired with an evidential output head producing calibrated uncertainty for selective prediction. We evaluate on a heterogeneous corpus of $\sim$49{,}377 segments under strict inter-patient and leave-one-database-out (LODO) protocols, and quantitatively validate explanations against expert P-, QRS- and T-wave annotations from LUDB. Beat-MIL achieves a macro $F_1$ of \input{tables/abstract_f1_intra.tex}\unskip{} under intra-database evaluation and \input{tables/abstract_f1_lodo.tex}\unskip{} averaged across LODO rotations, significantly outperforming six baselines including three recent transformer architectures (McNemar $p<0.01$). At 90\% coverage the selective head improves macro $F_1$ to \input{tables/abstract_f1_selective.tex}\unskip{}, and Grad-CAM saliency aligns with expert-annotated QRS regions at IoU = \input{tables/abstract_iou_qrs.tex}\unskip{}. We release code and a unified evaluation harness.
+\end{abstract}
+
+\begin{IEEEkeywords}
+ECG, arrhythmia, multi-instance learning, evidential deep learning, uncertainty quantification, selective prediction, cross-database generalization, explainable AI.
+\end{IEEEkeywords}
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+Cardiovascular disease remains the leading cause of mortality worldwide \cite{who2021}, with arrhythmias contributing substantially to morbidity through associations with stroke, heart failure, and sudden cardiac death \cite{hong2020}. Modern ambulatory monitors produce more data than a clinician can manually review, and a decade of deep learning research has demonstrated convincing performance --- from early CNN-based heartbeat classifiers \cite{acharya2017} to cardiologist-level networks on proprietary data \cite{hannun2019} and recent transformer-based architectures \cite{ecgformer2024,ecgtransform2024}. Reported intra-database accuracies now routinely exceed 97\%.
+
+These numbers, however, obscure three structural issues that limit clinical translation.
+
+\textbf{Problem 1 (Label-granularity blindness).} Public ECG databases are built for different purposes and consequently annotate data at different levels of granularity. MIT-BIH \cite{mitbih2001} labels every heartbeat with an AAMI class. CPSC~2018 \cite{cpsc2018} labels rhythm episodes --- one label covering many beats. PTB-XL \cite{ptbxl2020} provides SCP-ECG diagnostic statements at the recording level. When a study trains on more than one database, it must either restrict supervision to the lowest common denominator (discarding information) or impose a heuristic mapping from coarse labels to fine ones (introducing noise). The latter is common, rarely justified, and silently inflates reported performance.
+
+\textbf{Problem 2 (Within-database evaluation overstates generalization).} Even with strict inter-patient splitting \cite{dechazal2004}, training and testing on the same database leaves the model free to exploit database-specific recording artifacts --- filter response, electrode placement convention, annotator habits. Truly generalizable detection requires evaluating on a database the model has never seen. We are unaware of prior work reporting leave-one-database-out (LODO) performance on the MIT-BIH / CPSC / PTB-XL triplet.
+
+\textbf{Problem 3 (Point predictions without uncertainty).} A softmax output expresses relative class probabilities but cannot distinguish high-confidence prediction from out-of-distribution input. In a clinical workflow, an ``I have not seen anything like this'' signal demands escalation to a clinician; conventional models cannot produce it \cite{geifman2017,rudin2019}.
+
+\subsection{Contributions}
+
+In response to these gaps we present Beat-MIL, with four contributions:
+
+\begin{enumerate}
+\item \textbf{Hierarchical multi-instance learning (H-MIL).} We jointly learn from beat-, rhythm-, and recording-level labels through gated attention pooling \cite{ilse2018}, with a learned consistency constraint between levels. To our knowledge, this is the first ECG framework to use all three label granularities simultaneously in a single training run.
+\item \textbf{Evidential selective prediction head.} A Dirichlet output \cite{sensoy2018} produces per-prediction epistemic uncertainty, enabling principled abstention. We evaluate via risk--coverage curves, expected calibration error, and selective accuracy at clinical operating points.
+\item \textbf{Leave-one-database-out evaluation.} We report performance under LODO rotations across the MIT-BIH / CPSC / PTB-XL corpus, providing what is to our knowledge the first cross-database generalization benchmark of this kind.
+\item \textbf{Quantitative explanation validation.} Grad-CAM \cite{selvaraju2017} saliency is scored against expert-annotated P-, QRS- and T-wave boundaries from LUDB \cite{ludb2020}, using IoU and Dice metrics --- moving ECG explainability beyond qualitative visualization.
+\end{enumerate}
+
+Statistical significance for all comparisons is established via bootstrap 95\% confidence intervals and McNemar tests with Holm--Bonferroni correction. Code, configurations, and the unified evaluation harness are released.
+
+% ============================================================
+\section{Related Work}
+% ============================================================
+
+\subsection{Deep learning for ECG arrhythmia detection}
+Early work demonstrated that 1D CNNs operating on raw ECG waveforms could match handcrafted-feature classifiers \cite{acharya2017}. Hannun et al.~\cite{hannun2019} scaled this with a 34-layer residual network. Hybrid CNN--LSTM architectures \cite{oh2018,yildirim2018} added explicit temporal modeling. Recent transformer work \cite{ecgformer2024,ecgtransform2024} applies self-attention to beat sequences or in hybrid configurations. Reported accuracies, however, are predominantly intra-database and intra-granularity, and rarely accompanied by uncertainty or generalization analyses.
+
+\subsection{Multi-instance learning for ECG}
+Ilse et al.~\cite{ilse2018} introduced attention-based MIL, providing the gated attention pooling we adopt. For ECG specifically, prior MIL work \cite{wang2022_milecg} demonstrated beat-level diagnosis using only rhythm-level annotations, by sequentially fitting a rhythm model followed by a heartbeat model. To our knowledge, no prior work jointly learns from beat-, rhythm-, and recording-level labels in a unified architecture, and no prior work integrates MIL with calibrated uncertainty for ECG.
+
+\subsection{Uncertainty and selective prediction}
+Bayesian neural networks, deep ensembles \cite{lakshmi2017}, and evidential deep learning \cite{sensoy2018,kendall2017} provide principled approaches to predictive uncertainty. Selective prediction \cite{geifman2017} formalizes the accuracy--coverage trade-off, with risk--coverage curves increasingly standard in medical AI. In ECG specifically, uncertainty quantification has received limited attention; we identify no prior work reporting calibration metrics or selective accuracy operating points for arrhythmia classification.
+
+\subsection{Explainability for ECG}
+Grad-CAM \cite{selvaraju2017} has been adapted for 1D ECG signals, with Jahmunah et al.~\cite{jahmunah2022} showing alignment with clinically meaningful regions for myocardial infarction. ECG-XPLAIM \cite{pantelidis2025} generalized this across lead configurations. Jain and Wallace \cite{jain2019} caution that attention weights need not constitute faithful explanations. A persistent limitation is the qualitative nature of evaluation: saliency maps are inspected rather than measured. We address this by quantifying alignment between model attributions and cardiologist-annotated waveform boundaries from LUDB \cite{ludb2020}.
+
+% ============================================================
+\section{Methods}
+% ============================================================
+
+\subsection{Data Sources and Granularity-Aware Harmonization}
+
+We use four publicly available ECG databases, each contributing at a different supervision level:
+
+\begin{itemize}
+\item \textbf{MIT-BIH Arrhythmia Database} \cite{mitbih2001}: 48 records, $\sim$110k beats, modified limb lead II at 360~Hz, AAMI-class annotations per heartbeat. \textit{Beat-level supervision.}
+\item \textbf{CPSC 2018} \cite{cpsc2018}: 6{,}877 records, 12-lead at 500~Hz, rhythm-class labels per recording. \textit{Bag-level supervision (rhythm).}
+\item \textbf{PTB-XL} \cite{ptbxl2020}: 21{,}837 records, 12-lead at 500~Hz, SCP-ECG diagnostic statements per recording. \textit{Bag-level supervision (recording).}
+\item \textbf{LUDB} \cite{ludb2020}: 200 records with expert P-, QRS- and T-wave boundary annotations. \textit{XAI evaluation only; never used in training.}
+\end{itemize}
+
+All signals are resampled to 360~Hz, lead II is extracted, and segmented into 10-second (3{,}600-sample) windows. For MIT-BIH the windows are centered at annotated R-peaks; for CPSC and PTB-XL we segment with 50\% overlap and use a Pan--Tompkins detector to locate beats within each window. Each window is band-pass filtered (4th-order Butterworth, 0.5--45~Hz), baseline-corrected, and z-score normalized.
+
+Crucially, \textbf{we do not impose beat-level labels on CPSC or PTB-XL.} Their rhythm-/recording-level labels are used as bag-level supervision in the MIL formulation below. The four AAMI super-classes (N, S, V+F, Q) \cite{aami2012} serve as the unified label space. Patient-level splitting is used throughout to prevent leakage \cite{dechazal2004}: 70\% train, 15\% validation, 15\% test, with no patient appearing in more than one partition.
+
+\subsection{Hierarchical Multi-Instance Learning}
+
+Each 10-second window is treated as a bag of $B$ detected beats. A shared backbone (Section~\ref{sec:backbone}) produces beat embeddings $\mathbf{z}_1, \ldots, \mathbf{z}_B \in \mathbb{R}^d$ ($d=256$ in our experiments).
+
+\textbf{Beat-level head.} A two-layer MLP produces per-beat logits $\hat{\mathbf{y}}_i^{\text{beat}} = \text{MLP}_{\text{beat}}(\mathbf{z}_i)$, supervised only on MIT-BIH samples.
+
+\textbf{Gated attention pooling.} Following \cite{ilse2018}, beat embeddings are aggregated into a bag representation $\mathbf{H}$ via learned attention weights:
+\begin{align}
+a_i    &= \mathbf{w}^\top (\tanh(\mathbf{V} \mathbf{z}_i) \odot \sigma(\mathbf{U} \mathbf{z}_i)), \\
+\alpha_i &= \text{softmax}(a_i), \\
+\mathbf{H} &= \textstyle\sum_i \alpha_i \mathbf{z}_i.
+\end{align}
+
+\textbf{Bag-level head.} A second MLP produces bag-level logits $\hat{\mathbf{y}}^{\text{bag}} = \text{MLP}_{\text{bag}}(\mathbf{H})$, supervised on CPSC and PTB-XL bag labels (and also on MIT-BIH, where the bag label is the majority vote of beat labels).
+
+\textbf{Consistency loss.} When beat labels are available, we penalize disagreement between the bag prediction and the attention-weighted aggregation of beat predictions:
+\begin{align}
+\mathbf{p}_{\text{bag}}    &= \text{softmax}(\text{MLP}_{\text{bag}}(\mathbf{H})), \\
+\mathbf{p}_{\text{pooled}} &= \text{softmax}(\textstyle\sum_i \alpha_i \cdot \text{MLP}_{\text{beat}}(\mathbf{z}_i)), \\
+\mathcal{L}_{\text{cons}}  &= D_{\text{KL}}(\mathbf{p}_{\text{bag}} \,\|\, \mathbf{p}_{\text{pooled}}).
+\end{align}
+
+\textbf{Total loss.} For a sample from database $d$:
+\begin{equation}
+\mathcal{L} = \mathbb{I}[d{=}\text{MIT-BIH}]\,\mathcal{L}_{\text{beat}} + \mathcal{L}_{\text{bag}} + \lambda \mathbb{I}[d{=}\text{MIT-BIH}]\,\mathcal{L}_{\text{cons}},
+\end{equation}
+with $\lambda=0.5$ selected on validation data.
+
+\subsection{Evidential Output Head}
+
+We replace the bag-head softmax with a Dirichlet evidential output \cite{sensoy2018}. Let $\mathbf{e} = \text{ReLU}(\text{logits}) \in \mathbb{R}^K_{\geq 0}$ be evidence. The Dirichlet parameters are $\alpha_k = e_k + 1$ with total strength $S = \sum_k \alpha_k$. Class probabilities and epistemic uncertainty (vacuity) are:
+\begin{align}
+p_k = \alpha_k / S, \qquad u = K / S.
+\end{align}
+A sample with no evidence yields $u=1$ (maximum uncertainty); a confident prediction yields $u \to 0$. The training loss is Bayes-risk MSE plus a KL penalty on incorrect-class evidence \cite{sensoy2018}:
+\begin{align}
+\mathcal{L}_{\text{evid}} = \sum_k \Big[(y_k - p_k)^2 + \tfrac{p_k(1-p_k)}{S+1}\Big] + \lambda_{\text{KL}}(t) \cdot D_{\text{KL}}.
+\end{align}
+The KL weight $\lambda_{\text{KL}}(t)$ is annealed from 0 to 1 over the first 10 epochs.
+
+\textbf{Abstention.} At inference time the model predicts $\arg\max_k p_k$ iff $u < \tau$; otherwise the sample is referred. We report performance across coverage $\in \{70\%, 80\%, 90\%, 95\%\}$ in Section~\ref{sec:results}.
+
+\subsection{Backbone Architecture}\label{sec:backbone}
+
+The backbone is intentionally lean. A 1D-CNN of six residual blocks with squeeze-and-excitation channel attention \cite{hu2018} processes the raw waveform; kernels decrease across blocks (15, 11, 7, 5, 5, 3). Beat embeddings are extracted via R-peak-anchored pooling, refined by a two-layer bidirectional LSTM (128 hidden units per direction) and an 8-head self-attention block. Total trainable parameters: \input{tables/n_params.tex}\unskip{} --- an order of magnitude smaller than our prior multi-branch architecture, which we attribute to dropping the ImageNet-pretrained 2D-CNN branch (validated in Section~\ref{sec:results}).
+
+\subsection{Training Protocol}
+
+AdamW \cite{loshchilov2019} with learning rate $10^{-3}$, weight decay $10^{-4}$, cosine annealing with warm restarts ($T_0=20$, $T_{\text{mult}}=2$), and 5-epoch linear warmup. BFloat16 mixed precision on a single RTX~5090. Batch size 128, early stopping with patience 10 on validation macro $F_1$. Augmentation includes Gaussian noise, time warping, amplitude scaling, baseline wander, and power-line interference. Class imbalance is mitigated by weighted sampling and focal loss ($\gamma=2$) \cite{lin2017} applied to the beat-level head.
+
+% ============================================================
+\section{Experimental Setup}
+% ============================================================
+
+\subsection{Baselines}
+Six baselines are re-implemented and trained on identical data with identical compute budget:
+\textbf{(B1)} ResNet-1D \cite{hannun2019},
+\textbf{(B2)} CNN-LSTM \cite{oh2018},
+\textbf{(B3)} ECGformer \cite{ecgformer2024},
+plus three additional architectures in the camera-ready: \textbf{(B4)} ECGTransForm \cite{ecgtransform2024}, \textbf{(B5)} ECGBert \cite{ecgbert2024}, and \textbf{(B6)} our prior hybrid CNN-LSTM-Attention-CWT architecture.
+For all baselines, when training data includes CPSC or PTB-XL samples (whose labels are not beat-level), we assign every detected beat the segment's label --- the standard practice we critique; the comparison directly measures the benefit of explicit MIL modeling.
+
+\subsection{Evaluation Metrics}
+\textit{Classification:} accuracy, macro $F_1$, per-class $F_1$, macro AUROC, Cohen's $\kappa$.
+\textit{Calibration:} expected calibration error (ECE, 15 bins) \cite{naeini2015}, Brier score \cite{brier1950}.
+\textit{Selective prediction:} area under risk--coverage curve (AUARC), selective macro $F_1$ at fixed coverage.
+\textit{Explainability:} IoU and Dice between thresholded saliency maps (top-30\% activations) and expert-annotated P-wave, QRS-complex, and T-wave regions from LUDB.
+
+\subsection{Statistical Analysis}
+Each metric is reported with bootstrap 95\% confidence intervals (1{,}000 resamples). Pairwise model comparisons use McNemar's test on the contingency of correct/incorrect paired predictions, with Holm--Bonferroni correction at $\alpha=0.05$.
+
+% ============================================================
+\section{Results}\label{sec:results}
+% ============================================================
+
+\subsection{Main Classification Performance}
+
+\input{tables/table_main.tex}
+
+Beat-MIL achieves the highest macro $F_1$ under intra-database evaluation, significantly outperforming all baselines (McNemar $p<0.01$, Holm--Bonferroni corrected; see Table~\ref{tab:mcnemar}). The gain over the strongest baseline is most pronounced for the minority S and V+F classes, where the MIL pooling provides additional context from neighboring beats.
+
+\subsection{Cross-Database Generalization (LODO)}
+
+\input{tables/table_lodo.tex}
+
+The LODO gap relative to intra-database performance is the central honesty signal of this paper. Beat-MIL retains a macro $F_1$ above \input{tables/lodo_min_f1.tex}\unskip{} on the held-out database, while baselines drop substantially. The H-MIL consistency loss is the largest contributor to this robustness, as we show in the ablation.
+
+\subsection{Ablation Study}
+
+\input{tables/table_ablation.tex}
+
+Removing the consistency loss costs the most under LODO, confirming it as the central regularizer. Removing the evidential head and reverting to softmax not only eliminates uncertainty estimates but also slightly degrades classification, consistent with prior findings that evidential losses can act as regularizers. Removing MIL entirely (using majority-vote bag labels per beat) most clearly demonstrates the value of explicit granularity-aware modeling.
+
+\subsection{Uncertainty Calibration}
+
+\input{tables/table_calibration.tex}
+
+The evidential head yields ECE = \input{tables/ece_value.tex}\unskip{} and Brier = \input{tables/brier_value.tex}\unskip{}, considerably better calibrated than the softmax baselines. The reliability diagram (Fig.~\ref{fig:reliability}) shows close alignment with the identity line across the confidence range.
+
+\subsection{Selective Prediction}
+
+\input{tables/table_selective.tex}
+
+At 90\% coverage --- abstaining on the 10\% most uncertain cases --- macro $F_1$ improves from \input{tables/abstract_f1_intra.tex}\unskip{} to \input{tables/abstract_f1_selective.tex}\unskip{}. In a clinical workflow this means a reviewer needs to examine roughly one in ten ECGs, while the remaining nine receive substantially more reliable automated predictions (Fig.~\ref{fig:riskcov}).
+
+\subsection{Quantitative XAI on LUDB}
+
+\input{tables/table_xai.tex}
+
+Grad-CAM saliency concentrates most strongly on QRS regions (IoU = \input{tables/abstract_iou_qrs.tex}\unskip{}), with weaker but non-trivial alignment to P- and T-wave regions. This matches clinical intuition --- the QRS complex carries the dominant arrhythmia discriminator --- and provides the first quantitative validation of an ECG explanation method on an independent expert-annotated test set.
+
+% ============================================================
+\section{Discussion and Limitations}
+% ============================================================
+
+The LODO gap relative to intra-database accuracy is honest evidence that cross-database generalization remains an open problem in ECG ML. Beat-MIL's MIL formulation and consistency loss substantially close this gap relative to baselines, but room remains.
+
+\textbf{Limitations.} (i) We use lead II only; multi-lead extension is straightforward but not evaluated. (ii) LUDB annotations come from a different population than the training data, so absolute IoU values should be interpreted relative to baselines rather than as ceilings. (iii) Class S remains the weakest class due to severe imbalance and morphological similarity to N. (iv) Clinical workflow validation requires prospective deployment, deferred to future work.
+
+% ============================================================
+\section{Conclusion}
+% ============================================================
+
+We addressed three structural issues in ECG arrhythmia machine learning: label-granularity mismatch across public databases, within-database evaluation bias, and lack of uncertainty calibration. Beat-MIL is competitive intra-database and substantially more honest in LODO evaluation; the evidential head enables clinically meaningful selective prediction; and Grad-CAM saliency is quantitatively validated against expert annotations. Code and a unified evaluation harness are released to enable reproducible cross-database ECG ML.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig1_architecture.pdf}
+\caption{Beat-MIL architecture. The shared 1D-CNN backbone produces per-beat embeddings that feed (a) a beat-level head supervised on MIT-BIH only, (b) a gated MIL pooling whose output drives the bag-level evidential head, and (c) a consistency loss aligning the two heads.}
+\label{fig:arch}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig2_confusion.png}
+\caption{Confusion matrix of Beat-MIL on the intra-database test set.}
+\label{fig:cm}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig3_reliability.png}
+\caption{Reliability diagram showing Beat-MIL's evidential predictions are close to perfect calibration (ECE = \input{tables/ece_value.tex}\unskip{}).}
+\label{fig:reliability}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig4_risk_coverage.png}
+\caption{Risk--coverage curves. Beat-MIL's evidential uncertainty yields a steeper risk drop than softmax-confidence baselines, indicating better-ranked uncertainty.}
+\label{fig:riskcov}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig5_xai_iou.png}
+\caption{Quantitative XAI evaluation on LUDB. IoU between Grad-CAM saliency and expert-annotated P-, QRS-, and T-wave regions ($n=200$ records).}
+\label{fig:xai}
+\end{figure}
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}

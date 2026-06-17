@@ -1,0 +1,24 @@
+# Beat-MIL pinned dependencies.
+# PyTorch is installed separately via the cu128 index URL (see setup.sh)
+# because RTX 5090 needs the Blackwell-compatible wheel.
+
+# Scientific stack
+numpy>=1.26
+scipy>=1.13
+scikit-learn>=1.5
+pandas>=2.2
+matplotlib>=3.8
+seaborn>=0.13
+
+# ECG-specific
+wfdb>=4.1.2
+neurokit2>=0.2.10
+
+# Utilities
+tqdm>=4.66
+pyyaml>=6.0
+tensorboard>=2.16
+
+# Optional but recommended
+jupyter>=1.0
+ipywidgets>=8.1

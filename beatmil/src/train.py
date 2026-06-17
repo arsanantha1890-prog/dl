@@ -23,17 +23,19 @@ from unified_dataset import (
 )
 from beatmil import BeatMIL
 from baselines import build_baseline
-from evidential import evidential_loss, predict_with_uncertainty
+from evidential import evidential_loss, evidential_ce_loss, predict_with_uncertainty
 from consistency import consistency_loss
 from focal import focal_cross_entropy
 
 
 # ---------- training step ------------------------------------------------
 
-def beatmil_step(model, batch, optimizer, lambda_cons: float = 0.5,
-                 kl_weight: float = 0.1):
+def beatmil_step(model, batch, optimizer, lambda_cons: float = 0.3,
+                 kl_weight: float = 0.0, class_weights=None):
     out = model(batch["x"], batch["beat_positions"])
-    bag_out = evidential_loss(out["bag_evidence"], batch["bag_target"], kl_weight=kl_weight)
+    bag_out = evidential_ce_loss(out["bag_evidence"], batch["bag_target"],
+                                 class_weights=class_weights,
+                                 label_smoothing=0.05, kl_weight=kl_weight)
     L_bag = bag_out["loss"]
 
     # beat-level focal loss only on MIT-BIH samples
@@ -60,7 +62,8 @@ def beatmil_step(model, batch, optimizer, lambda_cons: float = 0.5,
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     return {"loss": loss.item(), "bag": L_bag.item(),
-            "beat": float(L_beat), "cons": L_cons.item()}
+            "beat": float(L_beat.detach()) if isinstance(L_beat, torch.Tensor) else float(L_beat),
+            "cons": float(L_cons.detach())}
 
 
 def baseline_step(model, batch, optimizer):
@@ -105,6 +108,30 @@ def evaluate(model, loader, device, is_beatmil: bool):
     }
 
 
+@torch.no_grad()
+def evaluate_beat_level(model, loader, device):
+    """Beat-level evaluation on MIT-BIH beats (the clean, standard benchmark).
+    Only beats with a real label (beat_targets >= 0) are scored. This is the
+    headline MIT-BIH AAMI number reviewers expect."""
+    model.eval()
+    all_preds, all_targets = [], []
+    for batch in loader:
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        out = model(batch["x"], batch["beat_positions"])
+        beat_logits = out["beat_logits"]              # (B, N, K)
+        beat_targets = batch["beat_targets"]          # (B, N)
+        mask = beat_targets >= 0
+        if mask.any():
+            preds = beat_logits[mask].argmax(dim=-1)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(beat_targets[mask].cpu().numpy())
+    if not all_preds:
+        return None
+    return {"preds": np.concatenate(all_preds),
+            "targets": np.concatenate(all_targets)}
+
+
 # ---------- collate function for variable-length bags --------------------
 
 def collate(batch):
@@ -120,25 +147,19 @@ def collate(batch):
 
 # ---------- main loop ----------------------------------------------------
 
-def build_loaders(specs_train, specs_val, loaders_per_db, batch_size, num_workers):
+def compute_class_weights(specs_train, K=4, device="cpu"):
     import numpy as np
-    from torch.utils.data import WeightedRandomSampler
+    labels = np.array([s.bag_label for s in specs_train], dtype=np.int64)
+    cc = np.bincount(labels, minlength=K).astype(np.float64)
+    w = 1.0 / (np.sqrt(cc) + 1e-6)        # sqrt-inverse-frequency: gentle
+    w = w / w.mean()                       # normalize around 1
+    return torch.tensor(w, dtype=torch.float32, device=device)
+
+
+def build_loaders(specs_train, specs_val, loaders_per_db, batch_size, num_workers):
     train_ds = UnifiedECGDataset(specs_train, loaders_per_db, augment=True)
     val_ds   = UnifiedECGDataset(specs_val,   loaders_per_db, augment=False)
-
-    # Class-balanced sampling: inverse-frequency weights over bag labels.
-    # Critical after the majority-vote fix, since most MIT-BIH windows are N.
-    labels = np.array([s.bag_label for s in specs_train], dtype=np.int64)
-    class_counts = np.bincount(labels, minlength=4).astype(np.float64)
-    class_weights = 1.0 / (class_counts + 1e-6)
-    sample_weights = class_weights[labels]
-    sampler = WeightedRandomSampler(
-        weights=torch.from_numpy(sample_weights).double(),
-        num_samples=len(labels),
-        replacement=True,
-    )
-
-    train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                           num_workers=num_workers, collate_fn=collate,
                           pin_memory=True, persistent_workers=(num_workers > 0),
                           prefetch_factor=(4 if num_workers > 0 else None))
@@ -170,12 +191,12 @@ def main():
     ap.add_argument("--out-dir", default="checkpoints")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--weight-decay", type=float, default=3e-4)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--lambda-cons", type=float, default=0.5)
+    ap.add_argument("--lambda-cons", type=float, default=0.3)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -214,6 +235,8 @@ def main():
 
     train_dl, val_dl = build_loaders(split["train"], split["val"], db_loaders,
                                      args.batch_size, args.num_workers)
+    class_weights = compute_class_weights(split["train"], K=len(AAMI_CLASSES), device=device)
+    print(f"[train] class weights: {class_weights.cpu().numpy().round(3)}")
 
     # Build model
     if args.model == "beatmil":
@@ -240,22 +263,36 @@ def main():
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                      for k, v in batch.items()}
             if is_beatmil:
-                info = beatmil_step(model, batch, opt, lambda_cons=args.lambda_cons)
+                info = beatmil_step(model, batch, opt, lambda_cons=args.lambda_cons, class_weights=class_weights)
             else:
                 info = baseline_step(model, batch, opt)
             ep_losses.append(info["loss"])
         sched.step()
 
-        # Validate
+        # Validate (bag-level)
         ev = evaluate(model, val_dl, device, is_beatmil)
         val_f1 = macro_f1(ev["preds"], ev["targets"])
         val_acc = float((ev["preds"] == ev["targets"]).mean())
         mean_loss = float(np.mean(ep_losses))
         elapsed = time.time() - t0
-        print(f"epoch {epoch:3d} | loss {mean_loss:.4f} | val_acc {val_acc:.4f} | "
-              f"val_F1 {val_f1:.4f} | {elapsed:.0f}s")
+
+        # Beat-level eval (the clean MIT-BIH headline number) — beatmil only
+        beat_acc = beat_f1 = None
+        if is_beatmil:
+            bev = evaluate_beat_level(model, val_dl, device)
+            if bev is not None and len(bev["preds"]) > 0:
+                beat_acc = float((bev["preds"] == bev["targets"]).mean())
+                beat_f1 = macro_f1(bev["preds"], bev["targets"])
+
+        msg = (f"epoch {epoch:3d} | loss {mean_loss:.4f} | "
+               f"bag_acc {val_acc:.4f} | bag_F1 {val_f1:.4f}")
+        if beat_acc is not None:
+            msg += f" | BEAT_acc {beat_acc:.4f} | BEAT_F1 {beat_f1:.4f}"
+        msg += f" | {elapsed:.0f}s"
+        print(msg)
         history.append({"epoch": epoch, "loss": mean_loss,
-                        "val_acc": val_acc, "val_f1": val_f1})
+                        "val_acc": val_acc, "val_f1": val_f1,
+                        "beat_acc": beat_acc, "beat_f1": beat_f1})
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1

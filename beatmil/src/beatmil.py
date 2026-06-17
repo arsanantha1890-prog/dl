@@ -165,6 +165,7 @@ class BeatMIL(nn.Module):
         self.beats = BeatExtractor(channels=self.backbone.out_channels)
         # MIL pooling and heads operate in 256-d space
         self.mil = GatedAttentionMIL(d_in=256, d_hidden=128)
+        self.head_dropout = nn.Dropout(0.3)            # regularize heads
         self.beat_head = nn.Linear(256, num_classes)   # per-beat logits
         self.bag_head = EvidentialHead(d_in=256, num_classes=num_classes)
         self.num_classes = num_classes
@@ -178,8 +179,8 @@ class BeatMIL(nn.Module):
         z, mask = self.beats(feats, beat_positions)
         H, alpha = self.mil(z, mask)
 
-        beat_logits = self.beat_head(z)         # (B, N, K)
-        evidence = self.bag_head(H)             # (B, K)
+        beat_logits = self.beat_head(self.head_dropout(z))   # (B, N, K)
+        evidence = self.bag_head(self.head_dropout(H))       # (B, K)
 
         return {
             "beat_logits": beat_logits,

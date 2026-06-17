@@ -176,3 +176,44 @@ def _smoke_test() -> None:
 
 if __name__ == "__main__":
     _smoke_test()
+
+
+# ---------- accuracy-first evidential training loss -----------------------
+
+def evidential_ce_loss(
+    evidence: torch.Tensor,        # (B, K)
+    targets: torch.Tensor,         # (B,)
+    class_weights: torch.Tensor | None = None,  # (K,)
+    label_smoothing: float = 0.05,
+    kl_weight: float = 0.0,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Train the evidential head with CROSS-ENTROPY on the Dirichlet
+    expected probability, instead of the Bayes-risk MSE. This optimizes
+    accuracy directly (like a softmax model) while keeping the Dirichlet
+    parameterization so uncertainty (vacuity u = K/S) is still available.
+
+    This fixes the well-known accuracy gap of evidential Bayes-risk training.
+    """
+    B, K = evidence.shape
+    alpha = evidence + 1.0
+    S = alpha.sum(dim=-1, keepdim=True)
+    p = alpha / S                                   # expected probability
+    log_p = torch.log(p + eps)                      # (B, K)
+
+    # cross-entropy with optional label smoothing and class weights
+    y = F.one_hot(targets, num_classes=K).float()
+    if label_smoothing > 0:
+        y = y * (1 - label_smoothing) + label_smoothing / K
+    ce = -(y * log_p).sum(dim=-1)                    # (B,)
+    if class_weights is not None:
+        w = class_weights[targets]
+        ce = ce * w
+
+    loss = ce.mean()
+    if kl_weight > 0:
+        # tiny KL toward uniform Dirichlet on wrong-class evidence, keeps u meaningful
+        alpha_tilde = y + (1.0 - y) * alpha
+        loss = loss + kl_weight * _kl_dirichlet_uniform(alpha_tilde).clamp(min=0).mean()
+
+    return {"loss": loss, "p": p.detach(), "alpha": alpha.detach()}

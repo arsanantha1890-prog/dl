@@ -340,12 +340,22 @@ def verify_split_integrity(cfg: Optional[PipelineConfig] = None) -> bool:
 # =====================================================================
 # Class weights for balanced training
 # =====================================================================
-def compute_class_weights(y: np.ndarray, n_classes: int = 3) -> np.ndarray:
-    """Inverse-frequency weights, normalised to mean 1.0. Use for focal-loss alpha
-    or a WeightedRandomSampler."""
+def compute_class_weights(y: np.ndarray, n_classes: int = 3,
+                          mode: str = "sqrt") -> np.ndarray:
+    """Class weights for focal-loss alpha, normalised to mean 1.0.
+
+    mode='inv'  : raw inverse frequency (aggressive — can invert the imbalance,
+                  i.e. make the model over-predict the rare class).
+    mode='sqrt' : square-root-tempered inverse frequency (recommended). Gives
+                  minority classes meaningful but bounded weight so the model
+                  doesn't collapse onto the rare class. For MIT-BIH this maps the
+                  S-class weight from ~12 (inv) down to ~3.5 (sqrt).
+    """
     counts = np.bincount(y, minlength=n_classes).astype(np.float64)
     counts[counts == 0] = 1.0
     w = counts.sum() / (n_classes * counts)
+    if mode == "sqrt":
+        w = np.sqrt(w)
     return (w / w.mean()).astype(np.float32)
 
 

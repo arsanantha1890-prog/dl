@@ -93,12 +93,13 @@ def precompute_scalograms(X, cfg, cache_path, verbose=True):
 # =====================================================================
 # Unified focal loss (used for baselines AND proposed model classification head)
 # =====================================================================
-def focal_loss_with_alpha(logits, targets, alpha, gamma=3.0, label_smoothing=0.05):
+def focal_loss_with_alpha(logits, targets, alpha, gamma=2.0, label_smoothing=0.05):
     """
     Class-weighted focal loss.
-    alpha: (C,) tensor of per-class weights — minority classes get higher weight.
-    gamma=3.0 is more aggressive than the default 2.0, needed for S class at ~3%.
-    label_smoothing reduced to 0.05 so minority-class gradients aren't washed out.
+    alpha: (C,) tensor of per-class weights (use sqrt-tempered, NOT raw inv-freq).
+    gamma=2.0 standard focal focusing.
+    Balancing is done by alpha ONLY — no WeightedRandomSampler — to avoid
+    stacking multiple balancing forces and over-correcting onto the rare class.
     """
     # Cross-entropy with class weights and label smoothing
     ce = F.cross_entropy(logits, targets, weight=alpha, reduction="none",
@@ -223,19 +224,16 @@ def train_model(args):
     ds_va = ECGWindowDataset(X_val,   y_val,   scal_va)
     ds_te = ECGWindowDataset(X_test,  y_test,  scal_te)
 
-    # --- Belt-and-suspenders class balancing ---
-    # 1. WeightedRandomSampler: oversamples S and V at batch construction time
-    # 2. alpha in focal loss: further penalises misclassifying S and V
-    cls_w = dp.compute_class_weights(y_train)
-    print(f"[balance] class weights (inv-freq): N={cls_w[0]:.3f}  S={cls_w[1]:.3f}  V={cls_w[2]:.3f}")
-    sample_w = cls_w[y_train]
-    sampler = WeightedRandomSampler(
-        torch.as_tensor(sample_w, dtype=torch.double),
-        num_samples=len(y_train), replacement=True
-    )
+    # --- Class balancing: alpha-weighted focal loss ONLY ---
+    # We deliberately use a SINGLE balancing mechanism. Stacking a
+    # WeightedRandomSampler on top of alpha weights on top of high gamma
+    # over-corrects and makes the model collapse onto the rare class (S).
+    # sqrt-tempered weights give S meaningful but bounded emphasis.
+    cls_w = dp.compute_class_weights(y_train, mode="sqrt")
+    print(f"[balance] sqrt class weights: N={cls_w[0]:.3f}  S={cls_w[1]:.3f}  V={cls_w[2]:.3f}")
     alpha = torch.as_tensor(cls_w, dtype=torch.float32, device=device)
 
-    dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, sampler=sampler,
+    dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True,
                        collate_fn=collate, num_workers=args.workers,
                        pin_memory=use_amp, drop_last=True)
     dl_va = DataLoader(ds_va, batch_size=args.batch_size, shuffle=False,
@@ -281,11 +279,12 @@ def train_model(args):
 
         sched.step()
 
-        # Print per-batch class distribution every 10 epochs to verify sampler is working
+        # Print batch class distribution every 10 epochs (natural shuffle order;
+        # should reflect true ~89/3/8 split — balancing is via loss weights).
         if epoch % 10 == 1:
             all_bl = torch.cat(batch_labels).numpy()
             bc = np.bincount(all_bl, minlength=3)
-            print(f"  [sampler check] epoch {epoch} batch class dist: "
+            print(f"  [batch dist] epoch {epoch}: "
                   f"N={bc[0]/bc.sum()*100:.1f}%  S={bc[1]/bc.sum()*100:.1f}%  V={bc[2]/bc.sum()*100:.1f}%")
 
         # Validation

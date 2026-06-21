@@ -1,39 +1,36 @@
 """
 Training + evaluation harness for the BMEiCON 2026 resubmission.
 
-One loop trains either the proposed model or any baseline on the identical
-DS1/DS2 split, then evaluates on DS2 and saves:
-  * best checkpoint (by val macro-F1, the early-stopping criterion),
-  * a metrics JSON with bootstrap 95% CIs,
-  * a predictions .npz (y_true, y_pred, y_prob) so McNemar tests can be run
-    ACROSS models afterwards with compare_models().
+Fixed for MIT-BIH class imbalance (S class ~3%, V ~8%, N ~89%):
+  - Class weights now actually reach the proposed model's loss (was being ignored)
+  - Focal loss gamma raised to 3.0 for harder minority-class focus
+  - Uncertainty log_var parameters clamped so the model can't collapse to N
+  - Sampler + alpha weights both active simultaneously for belt-and-suspenders
+  - Per-epoch class distribution printed so you can verify balance immediately
 
-Run (survives SSH disconnect):
-    nohup python train.py --model proposed --data_dir /data/mitbih \
-        --out runs/proposed --epochs 60 > runs/proposed.log 2>&1 &
+Run:
+    nohup python train.py --model proposed --data_dir /root/data/mitbih/mit-bih-arrhythmia-database-1.0.0 \
+        --out runs/proposed --epochs 80 > runs/proposed.log 2>&1 &
 
-    nohup python train.py --model cnn1d --data_dir /data/mitbih \
-        --out runs/cnn1d --epochs 60 > runs/cnn1d.log 2>&1 &
+    nohup python train.py --model cnn1d    --data_dir /root/data/mitbih/mit-bih-arrhythmia-database-1.0.0 \
+        --out runs/cnn1d   --epochs 80 > runs/cnn1d.log 2>&1 &
 
-Then compare:
+    nohup python train.py --model cnnlstm  --data_dir /root/data/mitbih/mit-bih-arrhythmia-database-1.0.0 \
+        --out runs/cnnlstm --epochs 80 > runs/cnnlstm.log 2>&1 &
+
+Compare after all finish:
     python train.py --compare runs/proposed runs/cnn1d runs/cnnlstm
-
-The proposed model defaults to the 1-D path (x_2d=None) because that is the
-cleaner headline model and far faster; pass --with_cwt to enable the ResNet-34
-scalogram branch (scalograms are precomputed once and memmapped, per the
-GPU-starvation lesson — never recomputed per epoch).
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import json
 import time
 import argparse
 import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 import data_pipeline as dp
@@ -45,8 +42,6 @@ from metrics import (compute_metrics, bootstrap_ci, mcnemar_test,
 # Dataset
 # =====================================================================
 class ECGWindowDataset(Dataset):
-    """Returns (x_1d (1,T), x_2d (3,H,W) or empty, label).
-    Scalograms, if provided, are a memmapped array aligned with X."""
     def __init__(self, X, y, scalograms=None):
         self.X = X
         self.y = y
@@ -76,7 +71,6 @@ def collate(batch):
 # Scalogram precompute (one-time, memmapped)
 # =====================================================================
 def precompute_scalograms(X, cfg, cache_path, verbose=True):
-    """Compute CWT scalograms for every window once and memmap them to disk."""
     n = len(X)
     shape = (n, 3, cfg.n_scales, cfg.cwt_width)
     if os.path.exists(cache_path):
@@ -97,32 +91,81 @@ def precompute_scalograms(X, cfg, cache_path, verbose=True):
 
 
 # =====================================================================
-# Model factory + unified loss
+# Unified focal loss (used for baselines AND proposed model classification head)
+# =====================================================================
+def focal_loss_with_alpha(logits, targets, alpha, gamma=3.0, label_smoothing=0.05):
+    """
+    Class-weighted focal loss.
+    alpha: (C,) tensor of per-class weights — minority classes get higher weight.
+    gamma=3.0 is more aggressive than the default 2.0, needed for S class at ~3%.
+    label_smoothing reduced to 0.05 so minority-class gradients aren't washed out.
+    """
+    # Cross-entropy with class weights and label smoothing
+    ce = F.cross_entropy(logits, targets, weight=alpha, reduction="none",
+                         label_smoothing=label_smoothing)
+    # Focal modulation: down-weight easy (correct, confident) examples
+    with torch.no_grad():
+        pt = F.softmax(logits.float(), dim=-1)
+        pt_target = pt.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_weight = (1.0 - pt_target) ** gamma
+    return (focal_weight * ce).mean()
+
+
+# =====================================================================
+# Model factory
 # =====================================================================
 def build_model(name, num_classes=3):
     if name == "proposed":
         from proposed_model import ProposedModel
-        return ProposedModel(num_classes=num_classes), True   # is_multitask
+        return ProposedModel(num_classes=num_classes), True
     from baselines import BASELINE_REGISTRY
     if name not in BASELINE_REGISTRY:
-        raise ValueError(f"unknown model '{name}'. "
-                         f"choices: proposed, {list(BASELINE_REGISTRY)}")
+        raise ValueError(f"unknown model '{name}'. choices: proposed, {list(BASELINE_REGISTRY)}")
     return BASELINE_REGISTRY[name](num_classes=num_classes), False
 
 
 def forward_and_loss(model, is_mt, x1d, x2d, labels, alpha):
-    """Returns (loss, cls_logits). Routes through the right objective."""
-    from baselines import focal_loss
+    """
+    Unified loss routing.
+
+    For the proposed model (is_mt=True): we bypass compute_loss() and apply
+    our class-weighted focal loss directly to cls_logits. This is the fix for
+    the original bug where alpha was ignored by the proposed model's internal loss.
+    The auxiliary detection head is still trained with a simple cross-entropy so
+    the multi-task structure is preserved, but the CLASSIFICATION head — the one
+    that determines predictions — is now properly weighted.
+
+    For baselines: standard focal loss with alpha weights.
+    """
     if is_mt:
         out = model(x1d, x2d)
-        loss_d = model.compute_loss(out, {"cls_target": labels})
-        return loss_d["loss"], out["cls_logits"]
-    logits = model(x1d)
-    return focal_loss(logits, labels, alpha=alpha), logits
+        cls_logits = out["cls_logits"]
+
+        # PRIMARY: class-weighted focal loss on the classification head
+        L_cls = focal_loss_with_alpha(cls_logits, labels, alpha)
+
+        # AUXILIARY: detection head (binary normal vs abnormal)
+        det_target = (labels > 0).long()
+        L_det = F.cross_entropy(out["det_logits"], det_target)
+
+        # Clamp log_var so uncertainty weighting can't collapse the cls loss.
+        # log_var is clamped to [-2, 1] => task weight in [exp(-1), exp(2)] ~ [0.37, 7.4]
+        log_var_cls = model.log_var_cls.clamp(-2.0, 1.0)
+        log_var_det = model.log_var_det.clamp(-2.0, 1.0)
+
+        # Uncertainty-weighted combination (Kendall 2018), but cls dominates
+        w_cls = torch.exp(-log_var_cls)
+        w_det = torch.exp(-log_var_det)
+        loss = (w_cls * L_cls + 0.5 * log_var_cls +
+                0.3 * w_det * L_det + 0.5 * log_var_det)
+        return loss, cls_logits
+    else:
+        logits = model(x1d)
+        return focal_loss_with_alpha(logits, labels, alpha), logits
 
 
 # =====================================================================
-# Train / eval loops
+# Eval loop
 # =====================================================================
 @torch.no_grad()
 def evaluate(model, is_mt, loader, device):
@@ -144,6 +187,9 @@ def evaluate(model, is_mt, loader, device):
     return y_true, y_pred, probs
 
 
+# =====================================================================
+# Training loop
+# =====================================================================
 def train_model(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp = (device == "cuda")
@@ -156,26 +202,37 @@ def train_model(args):
 
     data = dp.build_and_cache(cfg, cache_dir=args.cache_dir)
     X_train, y_train = data["X_train"], data["y_train"]
-    X_val, y_val = data["X_val"], data["y_val"]
-    X_test, y_test = data["X_test"], data["y_test"]
-    print(f"[data] train={len(y_train)} val={len(y_val)} test={len(y_test)}")
+    X_val,   y_val   = data["X_val"],   data["y_val"]
+    X_test,  y_test  = data["X_test"],  data["y_test"]
 
-    # Optional scalograms for the proposed model's 2D branch.
+    label_names = list(data["label_names"])
+    counts = np.bincount(y_train, minlength=3)
+    print(f"[data] train={len(y_train)}  val={len(y_val)}  test={len(y_test)}")
+    print(f"[data] train class counts: N={counts[0]}  S={counts[1]}  V={counts[2]}")
+    print(f"[data] train class %:      N={counts[0]/counts.sum()*100:.1f}%  "
+          f"S={counts[1]/counts.sum()*100:.1f}%  V={counts[2]/counts.sum()*100:.1f}%")
+
+    # Scalograms (optional, for proposed model 2D branch)
     scal_tr = scal_va = scal_te = None
     if args.model == "proposed" and args.with_cwt:
         scal_tr = precompute_scalograms(X_train, cfg, os.path.join(args.cache_dir, "scal_train.npy"))
-        scal_va = precompute_scalograms(X_val, cfg, os.path.join(args.cache_dir, "scal_val.npy"))
-        scal_te = precompute_scalograms(X_test, cfg, os.path.join(args.cache_dir, "scal_test.npy"))
+        scal_va = precompute_scalograms(X_val,   cfg, os.path.join(args.cache_dir, "scal_val.npy"))
+        scal_te = precompute_scalograms(X_test,  cfg, os.path.join(args.cache_dir, "scal_test.npy"))
 
     ds_tr = ECGWindowDataset(X_train, y_train, scal_tr)
-    ds_va = ECGWindowDataset(X_val, y_val, scal_va)
-    ds_te = ECGWindowDataset(X_test, y_test, scal_te)
+    ds_va = ECGWindowDataset(X_val,   y_val,   scal_va)
+    ds_te = ECGWindowDataset(X_test,  y_test,  scal_te)
 
-    # Balanced sampling: weight each sample by inverse class frequency.
+    # --- Belt-and-suspenders class balancing ---
+    # 1. WeightedRandomSampler: oversamples S and V at batch construction time
+    # 2. alpha in focal loss: further penalises misclassifying S and V
     cls_w = dp.compute_class_weights(y_train)
+    print(f"[balance] class weights (inv-freq): N={cls_w[0]:.3f}  S={cls_w[1]:.3f}  V={cls_w[2]:.3f}")
     sample_w = cls_w[y_train]
-    sampler = WeightedRandomSampler(torch.as_tensor(sample_w, dtype=torch.double),
-                                    num_samples=len(y_train), replacement=True)
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(sample_w, dtype=torch.double),
+        num_samples=len(y_train), replacement=True
+    )
     alpha = torch.as_tensor(cls_w, dtype=torch.float32, device=device)
 
     dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, sampler=sampler,
@@ -199,10 +256,13 @@ def train_model(args):
     best_f1, best_state, patience = -1.0, None, 0
     ckpt_path = os.path.join(args.out, "best.pt")
 
+    from sklearn.metrics import f1_score
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
         running = 0.0
+        batch_labels = []
+
         for x1d, x2d, y in dl_tr:
             x1d = x1d.to(device, non_blocking=use_amp)
             x2d = x2d.to(device) if x2d is not None else None
@@ -217,16 +277,26 @@ def train_model(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             running += loss.item()
+            batch_labels.append(y.cpu())
+
         sched.step()
 
-        # Validation macro-F1 = early-stopping signal.
+        # Print per-batch class distribution every 10 epochs to verify sampler is working
+        if epoch % 10 == 1:
+            all_bl = torch.cat(batch_labels).numpy()
+            bc = np.bincount(all_bl, minlength=3)
+            print(f"  [sampler check] epoch {epoch} batch class dist: "
+                  f"N={bc[0]/bc.sum()*100:.1f}%  S={bc[1]/bc.sum()*100:.1f}%  V={bc[2]/bc.sum()*100:.1f}%")
+
+        # Validation
         yv, pv, _ = evaluate(model, is_mt, dl_va, device)
-        from sklearn.metrics import f1_score
         val_f1 = f1_score(yv, pv, average="macro", zero_division=0)
+        val_f1_per = f1_score(yv, pv, average=None, labels=[0,1,2], zero_division=0)
         dt = time.time() - t0
-        print(f"[epoch {epoch:3d}] loss={running/max(1,len(dl_tr)):.4f} "
-              f"val_macroF1={val_f1:.4f} lr={opt.param_groups[0]['lr']:.2e} "
-              f"({dt:.1f}s)", flush=True)
+        print(f"[epoch {epoch:3d}] loss={running/max(1,len(dl_tr)):.4f}  "
+              f"val_macroF1={val_f1:.4f}  "
+              f"[N={val_f1_per[0]:.3f} S={val_f1_per[1]:.3f} V={val_f1_per[2]:.3f}]  "
+              f"lr={opt.param_groups[0]['lr']:.2e}  ({dt:.1f}s)", flush=True)
 
         if val_f1 > best_f1:
             best_f1 = val_f1
@@ -240,11 +310,10 @@ def train_model(args):
                 print(f"[early stop] no val improvement for {args.patience} epochs")
                 break
 
-    # Restore best and evaluate on DS2 test.
+    # Restore best checkpoint and evaluate on DS2
     if best_state is not None:
         model.load_state_dict(best_state)
     y_true, y_pred, y_prob = evaluate(model, is_mt, dl_te, device)
-    label_names = list(data["label_names"])
     mb = compute_metrics(y_true, y_pred, y_prob, label_names)
     cis = {m: bootstrap_ci(y_true, y_pred, m, n_boot=args.n_boot)
            for m in ("accuracy", "macro_f1", "weighted_f1", "cohen_kappa")}
@@ -262,8 +331,6 @@ def train_model(args):
 # Cross-model McNemar comparison
 # =====================================================================
 def compare_models(run_dirs):
-    """Load saved predictions from each run dir and run pairwise McNemar tests.
-    The first run dir is treated as the 'proposed' anchor."""
     preds, names = {}, []
     ref_y = None
     for d in run_dirs:
@@ -300,20 +367,17 @@ def compare_models(run_dirs):
 # =====================================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--compare", nargs="+", default=None,
-                    help="run dirs to McNemar-compare (first = anchor)")
-    ap.add_argument("--model", default="proposed",
-                    help="proposed | cnn1d | cnnlstm")
-    ap.add_argument("--data_dir", default=None, help="dir with MIT-BIH .dat/.hea/.atr")
+    ap.add_argument("--compare", nargs="+", default=None)
+    ap.add_argument("--model", default="proposed")
+    ap.add_argument("--data_dir", default=None)
     ap.add_argument("--out", default="runs/exp")
     ap.add_argument("--cache_dir", default="./cache")
-    ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--patience", type=int, default=15)
+    ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--window_size", type=int, default=3600)
-    ap.add_argument("--with_cwt", action="store_true",
-                    help="enable proposed model's ResNet-34 scalogram branch")
+    ap.add_argument("--with_cwt", action="store_true")
     ap.add_argument("--no_wavelet", action="store_true")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--n_boot", type=int, default=1000)

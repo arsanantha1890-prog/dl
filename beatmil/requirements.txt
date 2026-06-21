@@ -1,24 +1,12 @@
-# Beat-MIL pinned dependencies.
-# PyTorch is installed separately via the cu128 index URL (see setup.sh)
-# because RTX 5090 needs the Blackwell-compatible wheel.
+# Core
+torch>=2.1            # BFloat16 autocast, torch.amp
+torchvision>=0.16     # ResNet-34 ImageNet weights for the 2D branch
+numpy>=1.24
+scipy>=1.10           # Butterworth filtering (NOT used for CWT — see note)
+PyWavelets>=1.4       # CWT scalograms + wavelet baseline removal
+wfdb>=4.0             # MIT-BIH .dat/.hea/.atr reading
+scikit-learn>=1.3     # metrics
 
-# Scientific stack
-numpy>=1.26
-scipy>=1.13
-scikit-learn>=1.5
-pandas>=2.2
-matplotlib>=3.8
-seaborn>=0.13
-
-# ECG-specific
-wfdb>=4.1.2
-neurokit2>=0.2.10
-
-# Utilities
-tqdm>=4.66
-pyyaml>=6.0
-tensorboard>=2.16
-
-# Optional but recommended
-jupyter>=1.0
-ipywidgets>=8.1
+# NOTE: scipy.signal.cwt / morlet2 were REMOVED in scipy >= 1.15. The scalogram
+# generator uses PyWavelets (pywt.cwt, 'morl') instead. scipy is still needed
+# for the Butterworth band-pass filter only.

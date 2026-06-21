@@ -1,122 +1,96 @@
-# Beat-MIL: Run Order
+# MIT-BIH inter-patient pipeline — BMEiCON 2026 resubmission
 
-Three shell scripts orchestrate everything. Run them in this order:
+This is the **valid spine** for the resubmission: beat-level classification on
+the one database with genuine beat-level annotations (MIT-BIH), under the
+de Chazal inter-patient DS1/DS2 split, with the statistical rigor the JCSSE
+reviewer asked for. It deliberately does **not** propagate CPSC/PTB-XL
+rhythm/recording labels down to beats — that propagation was the central
+methodological flaw in the rejected submission.
 
-```bash
-# 1. ONE-TIME SETUP (per machine, ~5 minutes)
-#    creates directories, installs PyTorch + dependencies, verifies GPU
-bash setup.sh
+## Files
 
-# After setup:
-#   - place all 22 .py files into ~/beatmil/src/
-#   - symlink your datasets into ~/beatmil/data/{mitbih,cpsc2018,ptbxl}
-#   - download LUDB into ~/beatmil/data/ludb/
+| File | What it is | Status |
+|---|---|---|
+| `data_pipeline.py` | MIT-BIH loading, DS1/DS2 split, AAMI label mapping, windowing, preprocessing, CWT scalograms, integrity checks | tested on synthetic WFDB records |
+| `metrics.py` | accuracy / F1 / κ / AUROC, **bootstrap 95% CIs**, **McNemar** | self-tested |
+| `baselines.py` | two SOTA-lineage baselines (deep 1-D CNN; CNN-LSTM) on the identical split | smoke-tested |
+| `train.py` | one training/eval loop for proposed + baselines; saves predictions for cross-model McNemar | end-to-end tested |
+| `proposed_model.py` | your model, verbatim, with two real bug fixes applied | smoke-tested incl. B=1 inference |
+| `requirements.txt` | deps | — |
 
-# 2. SMOKE TEST (< 2 minutes)
-#    catches setup/code/GPU problems cheaply
-bash smoke_test.sh
+Everything was run in here on synthetic data to verify shapes, the split's
+no-leakage property, label dropping (Q and non-beat annotations), z-scoring,
+the new CWT, the full training loop, early stopping, bootstrap CIs, and McNemar.
+The numbers from your real run come from the GPU instance — none are fabricated.
 
-# 3. FULL PIPELINE (15-30 hours depending on GPU and dataset sizes)
-#    runs caching -> training -> evaluation -> figures
-bash run_all.sh
-#    or skip the (slow) LODO rotations:
-bash run_all.sh --skip-lodo
-```
+## Two bug fixes already applied to `proposed_model.py`
 
-After `run_all.sh` finishes, you have:
-- `~/beatmil/checkpoints/<model>_<mode>/best.pt` — trained models
-- `~/beatmil/outputs/eval/*.json` — all metrics with bootstrap CIs
-- `~/beatmil/outputs/eval/mcnemar.json` — statistical tests
-- `~/beatmil/outputs/eval/xai_summary.json` — LUDB IoU/Dice
-- `~/beatmil/figures/fig{2,3,4,5}_*.png` — paper figures
-- `~/beatmil/logs/*.log` — per-stage logs
+1. **`compute_loss`: `.squeeze()` → `.squeeze(1)`.** Bare `squeeze()` collapses a
+   `(B,1)` tensor to a scalar when `B==1`. Hardened.
+2. **`generate_cwt_scalogram` rewritten with PyWavelets.** The original used
+   `scipy.signal.cwt` / `morlet2`, **both removed in scipy ≥ 1.15** — it would
+   have raised `ImportError` on your instance. `pywt.cwt('morl')` is the drop-in.
 
-Then follow steps 21-32 of `WALKTHROUGH.md` for paper assembly.
+One operational constraint to know: the task heads use `BatchNorm1d`, which
+**cannot train on a size-1 batch**. `train.py` sets `drop_last=True` on the
+training loader so this can't happen; just don't remove that.
 
----
-
-## What each Python file does
-
-### Core architecture (immutable foundation — built and tested first)
-- `mil_pooling.py` — gated attention MIL pooling (Ilse 2018)
-- `evidential.py` — Dirichlet evidential output + selective prediction
-- `consistency.py` — bag-vs-pooled-beat KL loss (the H-MIL regularizer)
-- `beatmil.py` — full Beat-MIL model (3.01M params)
-- `unified_dataset.py` — granularity-aware dataset glue + splits
-- `focal.py` — focal cross-entropy for the beat head
-
-### Data loaders
-- `mitbih_loader.py` — MIT-BIH beat-level loader
-- `cpsc.py` — CPSC 2018 rhythm-bag loader
-- `ptbxl.py` — PTB-XL recording-bag loader
-- `ludb.py` — LUDB XAI loader (never used in training)
-
-### Baselines
-- `baselines.py` — ResNet-1D, CNN-LSTM, ECGformer (3 models)
-
-### Training
-- `train.py` — main training entry point (Beat-MIL + baselines, intra-DB + LODO)
-
-### Evaluation
-- `eval_metrics.py` — metrics + bootstrap CI + McNemar + calibration + selective
-- `xai.py` — Grad-CAM hook + IoU/Dice machinery
-
-### Orchestration (the scripts run_all.sh chains together)
-- `cache_specs.py` — pre-compute and cache spec lists
-- `sanity_mitbih.py` — verify MIT-BIH loader, save sample figure
-- `sanity_cpsc_ptbxl.py` — verify CPSC/PTB-XL loaders
-- `run_eval.py` — evaluate every checkpoint, save metrics JSON + raw preds
-- `run_mcnemar.py` — pairwise tests with Holm-Bonferroni
-- `run_xai.py` — Grad-CAM IoU on LUDB
-- `figures.py` — generate fig 2-5 from saved eval outputs
-
-### Tests
-- `integration_test.py` — end-to-end smoke test of the full Beat-MIL loss
-
----
-
-## Manual override examples
-
-Run just one piece, without the full pipeline:
+## How to run (on the Vast.ai instance)
 
 ```bash
-# train Beat-MIL only (skip baselines, LODO, eval)
-python train.py --model beatmil --mode intra-db \
-    --data-root ~/beatmil/data --out-dir ~/beatmil/checkpoints
+pip install -r requirements.txt
 
-# train one baseline
-python train.py --model resnet1d --mode intra-db \
-    --data-root ~/beatmil/data --out-dir ~/beatmil/checkpoints
+# 0. Sanity check the split before trusting anything (no data needed)
+python data_pipeline.py        # prints integrity checks, must say [PASS]
 
-# only run a single LODO rotation
-python train.py --model beatmil --mode lodo --held-out ptbxl \
-    --data-root ~/beatmil/data --out-dir ~/beatmil/checkpoints
+# 1. Train the proposed model (1-D path — the clean headline model)
+nohup python train.py --model proposed --data_dir /data/mitbih \
+    --out runs/proposed --epochs 60 > runs/proposed.log 2>&1 &
 
-# re-run eval after retraining one model
-python run_eval.py
+# 2. Train the baselines on the IDENTICAL split
+nohup python train.py --model cnn1d   --data_dir /data/mitbih --out runs/cnn1d   --epochs 60 > runs/cnn1d.log   2>&1 &
+nohup python train.py --model cnnlstm --data_dir /data/mitbih --out runs/cnnlstm --epochs 60 > runs/cnnlstm.log 2>&1 &
 
-# re-run McNemar after changing a baseline
-python run_mcnemar.py
+# 3. (optional ablation) proposed model WITH the ResNet-34 scalogram branch.
+#    Scalograms are precomputed once and memmapped — never recomputed per epoch.
+nohup python train.py --model proposed --with_cwt --data_dir /data/mitbih \
+    --out runs/proposed_cwt --epochs 60 > runs/proposed_cwt.log 2>&1 &
 
-# regenerate figures only
-python figures.py --results-dir ~/beatmil/outputs/eval \
-                  --out-dir ~/beatmil/figures
+# 4. Statistical comparison (paired McNemar on the same DS2 test set)
+python train.py --compare runs/proposed runs/cnn1d runs/cnnlstm
 ```
 
----
+`--data_dir` is the folder holding the MIT-BIH records (`100.dat/.hea/.atr`, …).
+Download once with: `wfdb.dl_database('mitdb', '/data/mitbih')`.
 
-## Definitions of done at each stage
+Monitor a run: `tail -f runs/proposed.log` (per-epoch val macro-F1 is printed).
 
-| After                 | You should see                                                    |
-|-----------------------|-------------------------------------------------------------------|
-| `setup.sh`            | `SM: (12, 0)` in the output and `requirements.txt` written        |
-| `smoke_test.sh`       | All 5 module tests pass + GPU forward/backward works              |
-| `cache_specs.py`      | ~150k samples cached in `outputs/cache/*.pkl`                     |
-| `sanity_mitbih.py`    | ~100k samples, class N ~84%, R-peak figure looks correct          |
-| `train.py` (Beat-MIL) | val macro F1 in `history.json` ≥ 0.85 after ~30 epochs            |
-| `run_eval.py`         | One JSON per checkpoint in `outputs/eval/`                        |
-| `run_mcnemar.py`      | `mcnemar.json` with p-values < 0.05 for at least one baseline     |
-| `run_xai.py`          | `xai_summary.json` with QRS IoU > 0.4                             |
-| `figures.py`          | 4 PNG files in `figures/`                                         |
+Each run writes `metrics.json` (with bootstrap CIs), `predictions.npz` (for
+McNemar), and `best.pt` (checkpoint at best val macro-F1).
 
-If any "you should see" doesn't match — stop and investigate before continuing. Errors compound.
+## Things to decide / sanity-check early (these affect the paper)
+
+- **Window size.** Defaults to 3600 (10 s) to match your model's input and the
+  LSTM/attention "rhythm context" argument. Each example is a 10-s window
+  labelled by its centre beat. If a reviewer prefers a tighter single-beat
+  window, set `--window_size 360`; the model accepts any length. Decide which
+  framing you'll defend and state it explicitly in the methods.
+- **The 2-D CWT branch earns its keep?** Run `runs/proposed` vs
+  `runs/proposed_cwt` and McNemar them. In the original paper the branch added
+  0.2% accuracy for ~88% of the parameters; if that gain isn't significant
+  under McNemar, the honest headline model is 1-D-only and the ResNet branch
+  becomes an ablation, not the centrepiece.
+- **The prediction head has no real labels** (`pred_target = cls_target > 0`).
+  With proper stats in the paper, a reviewer will ask why a "task" with
+  synthetic targets is in the multi-task claim. Cleanest framing: a beat
+  classifier with an auxiliary binary detection head, and be upfront that
+  detection is a deterministic coarsening of classification.
+
+## What still needs building (next, on your word)
+
+- **LUDB quantitative XAI** (IoU/Dice of Grad-CAM vs expert P/QRS/T
+  delineations). This is the strongest genuinely-novel contribution and is
+  independent of everything above.
+- **Calibration** analysis (ECE / reliability curve).
+- The paper rewrite + response-to-reviewers letter, scoped honestly to
+  "beat-level MIT-BIH under inter-patient evaluation."

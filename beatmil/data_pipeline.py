@@ -86,7 +86,8 @@ class PipelineConfig:
     target_fs: int = 360               # MIT-BIH native rate; no resampling needed
     bandpass_low: float = 0.5
     bandpass_high: float = 45.0
-    val_fraction: float = 0.10         # carved out of DS1 *by record*, not by beat
+    val_fraction: float = 0.25         # carved out of DS1 *by record*, not by beat
+                                       # 0.25 = ~5-6 records, enough for stable S F1
     wavelet_baseline: bool = True      # remove baseline wander via wavelet detrend
     n_scales: int = 64                 # CWT scalogram height
     cwt_width: int = 256               # CWT scalogram width (resized)

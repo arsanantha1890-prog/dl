@@ -128,37 +128,20 @@ def build_model(name, num_classes=3):
 def forward_and_loss(model, is_mt, x1d, x2d, labels, alpha):
     """
     Unified loss routing.
-
-    For the proposed model (is_mt=True): we bypass compute_loss() and apply
-    our class-weighted focal loss directly to cls_logits. This is the fix for
-    the original bug where alpha was ignored by the proposed model's internal loss.
-    The auxiliary detection head is still trained with a simple cross-entropy so
-    the multi-task structure is preserved, but the CLASSIFICATION head — the one
-    that determines predictions — is now properly weighted.
-
-    For baselines: standard focal loss with alpha weights.
+    For the proposed model: applies class-weighted focal loss to cls_logits
+    directly, bypassing compute_loss() for the classification term.
+    The auxiliary detection head uses plain cross-entropy.
     """
     if is_mt:
         out = model(x1d, x2d)
         cls_logits = out["cls_logits"]
-
-        # PRIMARY: class-weighted focal loss on the classification head
+        # Class-weighted focal loss on the classification head
         L_cls = focal_loss_with_alpha(cls_logits, labels, alpha)
-
-        # AUXILIARY: detection head (binary normal vs abnormal)
+        # Auxiliary detection head
         det_target = (labels > 0).long()
         L_det = F.cross_entropy(out["det_logits"], det_target)
-
-        # Clamp log_var so uncertainty weighting can't collapse the cls loss.
-        # log_var is clamped to [-2, 1] => task weight in [exp(-1), exp(2)] ~ [0.37, 7.4]
-        log_var_cls = model.log_var_cls.clamp(-2.0, 1.0)
-        log_var_det = model.log_var_det.clamp(-2.0, 1.0)
-
-        # Uncertainty-weighted combination (Kendall 2018), but cls dominates
-        w_cls = torch.exp(-log_var_cls)
-        w_det = torch.exp(-log_var_det)
-        loss = (w_cls * L_cls + 0.5 * log_var_cls +
-                0.3 * w_det * L_det + 0.5 * log_var_det)
+        # Fixed combination — no uncertainty weighting
+        loss = L_cls + 0.3 * L_det
         return loss, cls_logits
     else:
         logits = model(x1d)

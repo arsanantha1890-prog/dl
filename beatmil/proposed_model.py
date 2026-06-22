@@ -339,45 +339,29 @@ class ProposedModel(nn.Module):
         }
 
     def compute_loss(self, outputs: dict, targets: dict) -> dict:
-        """Uncertainty-weighted multi-task loss (Eq. 3 in paper)."""
-        # Classification loss (focal)
+        """Fixed-weight multi-task loss. Uncertainty weighting removed —
+        the learnable log_var parameters were destabilizing training by
+        driving the total loss negative while classification stagnated."""
         cls_logits = outputs["cls_logits"]
         cls_target = targets["cls_target"]
-        pt = F.softmax(cls_logits, dim=-1)
-        ce = F.cross_entropy(cls_logits, cls_target, reduction='none',
-                             label_smoothing=0.1)
-        # FIX: squeeze(1) not squeeze() — bare squeeze() crashes when B==1.
-        focal = ((1 - pt.gather(1, cls_target.unsqueeze(1)).squeeze(1)) ** 2) * ce
-        L_cls = focal.mean()
 
-        # Detection loss
-        det_logits = outputs["det_logits"]
+        # Standard cross-entropy (class weighting handled externally in train.py)
+        L_cls = F.cross_entropy(cls_logits, cls_target, label_smoothing=0.05)
+
+        # Auxiliary detection head
         det_target = targets.get("det_target")
         if det_target is None:
-            det_target = (cls_target > 0).long()  # 0=N=normal, >0=abnormal
-        L_det = F.cross_entropy(det_logits, det_target, label_smoothing=0.1)
+            det_target = (cls_target > 0).long()
+        L_det = F.cross_entropy(outputs["det_logits"], det_target)
 
-        # Prediction loss (MSE on risk score)
-        pred_logits = outputs["pred_logits"].squeeze(-1)
-        pred_target = targets.get("pred_target")
-        if pred_target is None:
-            pred_target = (cls_target > 0).float()  # simple proxy
-        L_pred = F.mse_loss(pred_logits, pred_target)
-
-        # Uncertainty weighting
-        w_det = torch.exp(-self.log_var_det)
-        w_cls = torch.exp(-self.log_var_cls)
-        w_pred = torch.exp(-self.log_var_pred)
-
-        total = (0.5 * w_det * L_det + 0.5 * self.log_var_det +
-                 0.5 * w_cls * L_cls + 0.5 * self.log_var_cls +
-                 0.5 * w_pred * L_pred + 0.5 * self.log_var_pred)
+        # Fixed weights: classification dominates, detection is auxiliary
+        total = L_cls + 0.3 * L_det
 
         return {
             "loss": total,
             "L_det": L_det.item(),
             "L_cls": L_cls.item(),
-            "L_pred": L_pred.item(),
+            "L_pred": 0.0,
         }
 
 
